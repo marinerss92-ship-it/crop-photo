@@ -3,9 +3,10 @@
 interface Props {
   done: number;
   total: number;
+  label?: string;
 }
 
-export function ProcessingView({ done, total }: Props) {
+export function ProcessingView({ done, total, label }: Props) {
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
   return (
@@ -26,7 +27,7 @@ export function ProcessingView({ done, total }: Props) {
           Processing {done} / {total}
         </p>
         <p className="text-sm text-zinc-500 mt-1">
-          Detecting photo regions and removing borders...
+          {label || "Detecting photo regions and removing borders..."}
         </p>
       </div>
 

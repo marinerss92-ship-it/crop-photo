@@ -14,8 +14,10 @@ export default function Home() {
   const [photos, setPhotos] = useState<PhotoItem[]>([]);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [selectedPhotoId, setSelectedPhotoId] = useState<string | null>(null);
+  const [icloudLoading, setIcloudLoading] = useState(false);
+  const [icloudError, setIcloudError] = useState("");
 
-  const handleFilesSelected = useCallback(async (files: File[]) => {
+  const processAndTrack = useCallback(async (files: File[]) => {
     const items: PhotoItem[] = files.map((f) => ({
       id: crypto.randomUUID(),
       file: f,
@@ -58,6 +60,67 @@ export default function Home() {
     setPhase("preview");
   }, []);
 
+  const handleFilesSelected = useCallback(
+    (files: File[]) => processAndTrack(files),
+    [processAndTrack]
+  );
+
+  const handleIcloudLink = useCallback(
+    async (url: string) => {
+      setIcloudLoading(true);
+      setIcloudError("");
+      setPhase("processing");
+      setProgress({ done: 0, total: 0 });
+
+      try {
+        const res = await fetch("/api/icloud", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url }),
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data.error || "Failed to fetch album");
+        }
+
+        const photoList: { name: string; url: string }[] = data.photos;
+        setProgress({ done: 0, total: photoList.length });
+
+        const files: File[] = [];
+        for (let i = 0; i < photoList.length; i++) {
+          try {
+            const proxyUrl = `/api/proxy?url=${encodeURIComponent(photoList[i].url)}`;
+            const imgRes = await fetch(proxyUrl);
+            const blob = await imgRes.blob();
+            const ext = blob.type === "image/png" ? ".png" : ".jpg";
+            const name = photoList[i].name.includes(".")
+              ? photoList[i].name
+              : `${photoList[i].name}${ext}`;
+            files.push(new File([blob], name, { type: blob.type }));
+          } catch {
+            // skip failed downloads
+          }
+          setProgress({ done: i + 1, total: photoList.length });
+        }
+
+        if (files.length === 0) {
+          throw new Error("Could not download any photos from this album");
+        }
+
+        setIcloudLoading(false);
+        await processAndTrack(files);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Failed to fetch album";
+        setIcloudError(msg);
+        setIcloudLoading(false);
+        setPhase("upload");
+      }
+    },
+    [processAndTrack]
+  );
+
   const handleCropSave = useCallback(
     (photoId: string, newCropRect: CropRect, newThumbnailUrl: string) => {
       setPhotos((prev) =>
@@ -81,9 +144,12 @@ export default function Home() {
     setPhotos([]);
     setProgress({ done: 0, total: 0 });
     setSelectedPhotoId(null);
+    setIcloudError("");
   }, []);
 
   const selectedPhoto = photos.find((p) => p.id === selectedPhotoId) || null;
+
+  const isDownloading = icloudLoading && phase === "processing";
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -91,7 +157,12 @@ export default function Home() {
       <header className="border-b border-zinc-200 bg-white">
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <svg className="w-7 h-7 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg
+              className="w-7 h-7 text-blue-600"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
               <path
                 strokeLinecap="round"
                 strokeLinejoin="round"
@@ -126,7 +197,16 @@ export default function Home() {
               </p>
             </div>
 
-            <UploadZone onFilesSelected={handleFilesSelected} />
+            {icloudError && (
+              <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
+                {icloudError}
+              </div>
+            )}
+
+            <UploadZone
+              onFilesSelected={handleFilesSelected}
+              onIcloudLink={handleIcloudLink}
+            />
 
             <div className="mt-16 grid grid-cols-3 gap-8 text-center">
               <div>
@@ -135,7 +215,7 @@ export default function Home() {
                 </div>
                 <p className="text-sm font-medium text-zinc-800">Upload</p>
                 <p className="text-xs text-zinc-500 mt-1">
-                  Drop or select your screenshots
+                  Drop files or paste an iCloud link
                 </p>
               </div>
               <div>
@@ -162,7 +242,15 @@ export default function Home() {
 
         {phase === "processing" && (
           <div className="max-w-2xl mx-auto px-6 py-16">
-            <ProcessingView done={progress.done} total={progress.total} />
+            {isDownloading ? (
+              <ProcessingView
+                done={progress.done}
+                total={progress.total}
+                label="Downloading photos from iCloud"
+              />
+            ) : (
+              <ProcessingView done={progress.done} total={progress.total} />
+            )}
           </div>
         )}
 
