@@ -1,102 +1,181 @@
 import { NextRequest, NextResponse } from "next/server";
 
-interface Derivative {
-  checksum: string;
-  fileSize: number | string;
-  width: number | string;
-  height: number | string;
-}
-
-interface PhotoEntry {
-  photoGuid: string;
-  caption?: string;
-  dateCreated?: string;
-  derivatives: Record<string, Derivative>;
-}
-
-interface AssetUrlItem {
-  url_expiry: string;
-  url_location: string;
-  url_path: string;
-}
-
-interface AssetLocations {
-  [host: string]: { scheme: string; hosts: string[] };
-}
+export const maxDuration = 60;
 
 function extractToken(url: string): string | null {
   const match = url.match(
-    /(?:share\.icloud\.com\/photos\/|sharedalbum\/#)([A-Za-z0-9_-]+)/
+    /(?:share\.icloud\.com\/photos\/|icloud\.com\/photos\/#|sharedalbum\/#)([A-Za-z0-9_-]+)/
   );
   return match ? match[1].split("#")[0] : null;
 }
 
-function pickBestDerivative(derivatives: Record<string, Derivative>): {
-  key: string;
-  derivative: Derivative;
-} | null {
-  let best: { key: string; derivative: Derivative } | null = null;
-  let bestPixels = 0;
-
-  for (const [key, d] of Object.entries(derivatives)) {
-    const pixels = Number(d.width) * Number(d.height);
-    if (pixels > bestPixels) {
-      bestPixels = pixels;
-      best = { key, derivative: d };
-    }
-  }
-  return best;
+interface ResolveResult {
+  partition: string;
+  zoneID: { zoneName: string; ownerRecordName: string };
+  authToken: string;
+  photoCount: number;
 }
 
-async function discoverPartition(
-  token: string
-): Promise<{ partition: string; streamData: Record<string, unknown> }> {
-  const partitions = ["p48", "p47", "p46", "p45", "p44", "p43"];
+async function resolveShortGUID(token: string): Promise<ResolveResult> {
+  const res = await fetch(
+    "https://p48-ckdatabasews.icloud.com/database/1/com.apple.photos.cloud/production/public/records/resolve",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "https://www.icloud.com",
+      },
+      body: JSON.stringify({
+        shortGUIDs: [{ value: token }],
+      }),
+    }
+  );
 
-  for (const p of partitions) {
-    const url = `https://${p}-sharedstreams.icloud.com/${token}/sharedstreams/webstream`;
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "text/plain",
-          Origin: "https://www.icloud.com",
-        },
-        body: JSON.stringify({ streamCtag: null }),
-      });
+  if (!res.ok) throw new Error("Failed to resolve iCloud link");
 
-      if (res.status === 330) {
-        const body = await res.json();
-        const host = body["X-Apple-MMe-Host"];
-        if (host) {
-          const correctPartition = host.split("-sharedstreams")[0];
-          const retryUrl = `https://${correctPartition}-sharedstreams.icloud.com/${token}/sharedstreams/webstream`;
-          const retryRes = await fetch(retryUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "text/plain",
-              Origin: "https://www.icloud.com",
-            },
-            body: JSON.stringify({ streamCtag: null }),
+  const data = await res.json();
+  const result = data.results?.[0];
+  if (!result) throw new Error("No results from resolve");
+
+  const anon = result.anonymousPublicAccess;
+  if (!anon?.token) {
+    throw new Error(
+      "This album requires sign-in to access. Only public iCloud links are supported."
+    );
+  }
+
+  const photoCount =
+    result.rootRecord?.fields?.photosCount?.value ??
+    result.rootRecord?.fields?.assetCount?.value ??
+    0;
+
+  return {
+    partition: anon.databasePartition.replace(/^https?:\/\//, "").replace(/:443$/, ""),
+    zoneID: result.zoneID,
+    authToken: anon.token,
+    photoCount,
+  };
+}
+
+interface AssetRecord {
+  recordName: string;
+  masterRecordName: string;
+}
+
+async function fetchAllAssets(
+  partition: string,
+  zoneID: { zoneName: string; ownerRecordName: string },
+  authToken: string,
+  maxPhotos: number
+): Promise<AssetRecord[]> {
+  const baseUrl = `https://${partition}/database/1/com.apple.photos.cloud/production/shared/changes/zone`;
+  const params = `remapEnums=true&getCurrentSyncToken=true&publicAccessAuthToken=${encodeURIComponent(authToken)}`;
+
+  const assets: AssetRecord[] = [];
+  let syncToken: string | undefined;
+
+  for (let page = 0; page < 100; page++) {
+    const body: Record<string, unknown> = {
+      zones: [{ zoneID, ...(syncToken ? { syncToken } : {}) }],
+    };
+
+    const res = await fetch(`${baseUrl}?${params}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "https://www.icloud.com",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) throw new Error(`Zone changes failed: ${res.status}`);
+    const data = await res.json();
+    const zone = data.zones?.[0];
+    if (!zone) break;
+
+    for (const r of zone.records || []) {
+      if (r.recordType === "CPLAsset" && !r.deleted) {
+        const masterRef = r.fields?.masterRef?.value?.recordName;
+        if (masterRef) {
+          assets.push({
+            recordName: r.recordName,
+            masterRecordName: masterRef,
           });
-          if (retryRes.ok) {
-            return {
-              partition: correctPartition,
-              streamData: await retryRes.json(),
-            };
-          }
         }
       }
+    }
 
-      if (res.ok) {
-        return { partition: p, streamData: await res.json() };
-      }
-    } catch {
-      continue;
+    syncToken = zone.syncToken;
+    if (!zone.moreComing) break;
+    if (assets.length >= maxPhotos) break;
+  }
+
+  return assets.slice(0, maxPhotos);
+}
+
+interface PhotoInfo {
+  name: string;
+  url: string;
+  width: number;
+  height: number;
+  thumbUrl: string;
+}
+
+async function lookupMasters(
+  partition: string,
+  zoneID: { zoneName: string; ownerRecordName: string },
+  authToken: string,
+  masterRecordNames: string[]
+): Promise<PhotoInfo[]> {
+  const baseUrl = `https://${partition}/database/1/com.apple.photos.cloud/production/shared/records/lookup`;
+  const params = `remapEnums=true&publicAccessAuthToken=${encodeURIComponent(authToken)}`;
+  const photos: PhotoInfo[] = [];
+
+  const batchSize = 50;
+  for (let i = 0; i < masterRecordNames.length; i += batchSize) {
+    const batch = masterRecordNames.slice(i, i + batchSize);
+    const body = {
+      records: batch.map((n) => ({ recordName: n })),
+      zoneID,
+      numbersAsStrings: true,
+    };
+
+    const res = await fetch(`${baseUrl}?${params}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "https://www.icloud.com",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) continue;
+    const data = await res.json();
+
+    for (const r of data.records || []) {
+      if (r.recordType !== "CPLMaster") continue;
+      const fields = r.fields || {};
+
+      const orig = fields.resOriginalRes?.value;
+      const med = fields.resJPEGMedRes?.value;
+      const thumb = fields.resJPEGThumbRes?.value;
+
+      const best = orig || med;
+      if (!best?.downloadURL) continue;
+
+      const filename = fields.filenameEnc?.value || `photo-${photos.length + 1}.jpg`;
+
+      photos.push({
+        name: typeof filename === "string" ? filename : `photo-${photos.length + 1}.jpg`,
+        url: best.downloadURL,
+        width: Number(fields.resOriginalWidth?.value || 0),
+        height: Number(fields.resOriginalHeight?.value || 0),
+        thumbUrl: thumb?.downloadURL || med?.downloadURL || best.downloadURL,
+      });
     }
   }
 
-  throw new Error("Could not find iCloud partition server");
+  return photos;
 }
 
 export async function POST(request: NextRequest) {
@@ -114,70 +193,37 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const { partition, streamData } = await discoverPartition(token);
-    const photos: PhotoEntry[] =
-      (streamData as { photos?: PhotoEntry[] }).photos || [];
+    const { partition, zoneID, authToken, photoCount } =
+      await resolveShortGUID(token);
 
-    if (photos.length === 0) {
+    const maxPhotos = 1200;
+    const assets = await fetchAllAssets(
+      partition,
+      zoneID,
+      authToken,
+      maxPhotos
+    );
+
+    if (assets.length === 0) {
       return NextResponse.json(
         { error: "No photos found in this album" },
         { status: 404 }
       );
     }
 
-    const photoGuids = photos.map((p) => p.photoGuid);
-    const assetRes = await fetch(
-      `https://${partition}-sharedstreams.icloud.com/${token}/sharedstreams/webasseturls`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "text/plain",
-          Origin: "https://www.icloud.com",
-        },
-        body: JSON.stringify({ photoGuids }),
-      }
+    const masterNames = assets.map((a) => a.masterRecordName);
+    const photos = await lookupMasters(
+      partition,
+      zoneID,
+      authToken,
+      masterNames
     );
 
-    if (!assetRes.ok) {
-      return NextResponse.json(
-        { error: "Failed to fetch photo URLs" },
-        { status: 502 }
-      );
-    }
-
-    const assetData = (await assetRes.json()) as {
-      items: Record<string, AssetUrlItem>;
-      locations: AssetLocations;
-    };
-
-    const results: {
-      name: string;
-      url: string;
-      width: number;
-      height: number;
-    }[] = [];
-
-    for (let i = 0; i < photos.length; i++) {
-      const photo = photos[i];
-      const best = pickBestDerivative(photo.derivatives);
-      if (!best) continue;
-
-      const assetItem = assetData.items[best.derivative.checksum];
-      if (!assetItem) continue;
-
-      const loc = assetData.locations[assetItem.url_location];
-      if (!loc) continue;
-
-      const downloadUrl = `${loc.scheme}://${loc.hosts[0]}${assetItem.url_path}`;
-      results.push({
-        name: photo.caption || `icloud-photo-${i + 1}.jpg`,
-        url: downloadUrl,
-        width: Number(best.derivative.width),
-        height: Number(best.derivative.height),
-      });
-    }
-
-    return NextResponse.json({ photos: results, total: results.length });
+    return NextResponse.json({
+      photos,
+      total: photos.length,
+      albumTotal: photoCount,
+    });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
